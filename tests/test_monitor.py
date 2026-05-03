@@ -203,6 +203,27 @@ def test_format_diff_truncates_huge_messages():
 # ---------------------------------------------------------------------------
 
 
+def test_ping_healthchecks_noop_when_url_missing(httpx_mock):
+    # No mocked responses registered → if it tried to GET, pytest-httpx would fail.
+    monitor.ping_healthchecks(None)
+    monitor.ping_healthchecks("")
+
+
+def test_ping_healthchecks_calls_url(httpx_mock):
+    httpx_mock.add_response(url="https://hc-ping.com/abc", status_code=200)
+    httpx_mock.add_response(url="https://hc-ping.com/abc/start", status_code=200)
+    httpx_mock.add_response(url="https://hc-ping.com/abc/fail", status_code=200)
+    monitor.ping_healthchecks("https://hc-ping.com/abc")
+    monitor.ping_healthchecks("https://hc-ping.com/abc", "/start")
+    monitor.ping_healthchecks("https://hc-ping.com/abc", "/fail")
+
+
+def test_ping_healthchecks_swallows_errors(httpx_mock):
+    httpx_mock.add_exception(httpx.ConnectError("nope"))
+    # Must not raise.
+    monitor.ping_healthchecks("https://hc-ping.com/abc")
+
+
 async def test_send_telegram_swallows_errors():
     bot = AsyncMock()
     bot.send_message.side_effect = RuntimeError("boom")
@@ -224,6 +245,7 @@ async def test_run_once_first_baseline_then_drift(tmp_path: Path, httpx_mock, mo
         telegram_chat_id="42",
         interval_seconds=1,
         snapshots_dir=tmp_path / "snapshots",
+        healthchecks_url=None,
     )
 
     # First cycle: list zones, then settings (http3=off).

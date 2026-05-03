@@ -44,6 +44,7 @@ class Config:
     telegram_chat_id: str
     interval_seconds: int
     snapshots_dir: Path
+    healthchecks_url: str | None
 
 
 def load_config() -> Config:
@@ -64,7 +65,24 @@ def load_config() -> Config:
         telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
         interval_seconds=int(interval_hours * 3600),
         snapshots_dir=snapshots_dir,
+        healthchecks_url=(os.getenv("HEALTHCHECKS_URL") or "").rstrip("/") or None,
     )
+
+
+# ---------------------------------------------------------------------------
+# Healthchecks.io
+# ---------------------------------------------------------------------------
+
+
+def ping_healthchecks(base_url: str | None, suffix: str = "") -> None:
+    """Ping a healthchecks.io URL. Suffix is '', '/start', or '/fail'."""
+    if not base_url:
+        return
+    url = base_url + suffix
+    try:
+        httpx.get(url, timeout=10.0)
+    except Exception as exc:  # noqa: BLE001 - never break the audit
+        logger.warning("healthchecks ping (%s) failed: %s", suffix or "ok", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +257,12 @@ async def send_telegram(bot: Bot, chat_id: str, text: str) -> None:
 
 async def run_once(cf: CloudflareClient, bot: Bot, cfg: Config) -> None:
     """Run a single audit pass over every zone."""
+    ping_healthchecks(cfg.healthchecks_url, "/start")
     try:
         zones = cf.list_zones()
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to list zones: %s", exc)
+        ping_healthchecks(cfg.healthchecks_url, "/fail")
         return
 
     logger.info("Auditing %d zone(s)", len(zones))
@@ -273,6 +293,7 @@ async def run_once(cf: CloudflareClient, bot: Bot, cfg: Config) -> None:
         await send_telegram(bot, cfg.telegram_chat_id, message)
 
     LAST_RUN_MARKER.write_text(datetime.now(timezone.utc).isoformat())
+    ping_healthchecks(cfg.healthchecks_url)
 
 
 # ---------------------------------------------------------------------------
