@@ -1,0 +1,11 @@
+services:
+  cf-watchdog:
+    image: registry.developpeur-freelance.io/silent/cf-watchdog/app:latest
+    build: .
+    container_name: cf-watchdog
+    restart: always
+    env_file: .env
+    environment:
+      SNAPSHOTS_DIR: /app/snapshots
+    volumes:
+      - ./snapshots:/app/snapshots
