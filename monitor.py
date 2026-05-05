@@ -263,6 +263,11 @@ def collect_zone_state(
             rs_id = rs.get("id")
             if not rs_id:
                 continue
+            if rs.get("kind") == "managed":
+                # Cloudflare-managed rulesets are listed at zone scope but their
+                # detail document only exists at /accounts/.../rulesets/{id}.
+                # Skip — drift on Cloudflare-owned content isn't ours to track.
+                continue
             detail = _section(f"ruleset {rs_id}", cf.get_ruleset, zone_id, rs_id)
             if detail is not None:
                 rulesets[rs_id] = detail
