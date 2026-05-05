@@ -1,8 +1,9 @@
 """Cloudflare configuration drift monitor.
 
-Polls Cloudflare zone settings on a fixed interval, snapshots them as JSON,
-diffs each snapshot against the previous one with deepdiff, and posts a
-Markdown alert to Telegram whenever anything changes.
+Polls Cloudflare zone settings + selected per-zone resources on a fixed
+interval, snapshots them as JSON, diffs each snapshot against the previous
+one with deepdiff, and posts a Markdown alert to Telegram whenever anything
+changes.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +30,7 @@ from telegram.helpers import escape_markdown
 CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4"
 LAST_RUN_MARKER = Path(".last_run")
 TELEGRAM_MAX_LEN = 3800  # leave headroom under the 4096 hard limit
+SNAPSHOT_SCHEMA = "v2"
 
 logger = logging.getLogger("cf-watchdog")
 
@@ -45,6 +48,7 @@ class Config:
     interval_seconds: int
     snapshots_dir: Path
     healthchecks_url: str | None
+    request_delay_seconds: float = 2.0
 
 
 def load_config() -> Config:
@@ -58,6 +62,7 @@ def load_config() -> Config:
 
     interval_hours = float(os.getenv("CHECK_INTERVAL_HOURS", "6"))
     snapshots_dir = Path(os.getenv("SNAPSHOTS_DIR", "./snapshots")).resolve()
+    request_delay = float(os.getenv("CLOUDFLARE_REQUEST_DELAY", "2.0"))
 
     return Config(
         cloudflare_token=os.environ["CLOUDFLARE_API_TOKEN"],
@@ -66,6 +71,7 @@ def load_config() -> Config:
         interval_seconds=int(interval_hours * 3600),
         snapshots_dir=snapshots_dir,
         healthchecks_url=(os.getenv("HEALTHCHECKS_URL") or "").rstrip("/") or None,
+        request_delay_seconds=request_delay,
     )
 
 
@@ -90,10 +96,23 @@ def ping_healthchecks(base_url: str | None, suffix: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
+# HTTP statuses that mean "the feature/resource isn't enabled on this plan"
+# rather than a real error. We capture them in the snapshot as `_status: code`
+# so a future plan upgrade surfaces as drift.
+_GRACEFUL_STATUSES = (403, 404, 405)
+
+
 class CloudflareClient:
     """Thin wrapper around the Cloudflare REST API."""
 
-    def __init__(self, token: str, *, client: httpx.Client | None = None) -> None:
+    def __init__(
+        self,
+        token: str,
+        *,
+        client: httpx.Client | None = None,
+        request_delay_seconds: float = 0.0,
+        sleep: Any = time.sleep,
+    ) -> None:
         self._client = client or httpx.Client(
             base_url=CLOUDFLARE_API_BASE,
             headers={
@@ -102,6 +121,9 @@ class CloudflareClient:
             },
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
+        self._request_delay = request_delay_seconds
+        self._sleep = sleep
+        self._first_request = True
 
     def close(self) -> None:
         self._client.close()
@@ -112,17 +134,46 @@ class CloudflareClient:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
+    # -- internals -----------------------------------------------------------
+
+    def _get(self, path: str, **kwargs: Any) -> httpx.Response:
+        if self._first_request:
+            self._first_request = False
+        elif self._request_delay > 0:
+            self._sleep(self._request_delay)
+        return self._client.get(path, **kwargs)
+
+    def _get_json(self, path: str, **kwargs: Any) -> dict[str, Any]:
+        r = self._get(path, **kwargs)
+        r.raise_for_status()
+        payload = r.json()
+        if not payload.get("success", False):
+            raise RuntimeError(f"Cloudflare API error at {path}: {payload.get('errors')}")
+        return payload
+
+    def _get_result_or_status(self, path: str) -> dict[str, Any]:
+        """Fetch a single-resource endpoint, treating 'feature not available'
+        statuses as a stable, diff-friendly placeholder."""
+        r = self._get(path)
+        if r.status_code in _GRACEFUL_STATUSES:
+            return {"_status": r.status_code}
+        r.raise_for_status()
+        payload = r.json()
+        if not payload.get("success", False):
+            raise RuntimeError(f"Cloudflare API error at {path}: {payload.get('errors')}")
+        return payload.get("result") or {}
+
+    # -- endpoints -----------------------------------------------------------
+
     def list_zones(self) -> list[dict[str, Any]]:
         """Return every zone visible to the token (paginated)."""
         zones: list[dict[str, Any]] = []
         page = 1
         per_page = 50
         while True:
-            r = self._client.get("/zones", params={"page": page, "per_page": per_page})
-            r.raise_for_status()
-            payload = r.json()
-            if not payload.get("success", False):
-                raise RuntimeError(f"Cloudflare API error: {payload.get('errors')}")
+            payload = self._get_json(
+                "/zones", params={"page": page, "per_page": per_page}
+            )
             result = payload.get("result", [])
             zones.extend(result)
             info = payload.get("result_info") or {}
@@ -134,13 +185,96 @@ class CloudflareClient:
 
     def get_zone_settings(self, zone_id: str) -> dict[str, dict[str, Any]]:
         """Return zone settings keyed by setting id (stable across reorders)."""
-        r = self._client.get(f"/zones/{zone_id}/settings")
-        r.raise_for_status()
-        payload = r.json()
-        if not payload.get("success", False):
-            raise RuntimeError(f"Cloudflare API error: {payload.get('errors')}")
+        payload = self._get_json(f"/zones/{zone_id}/settings")
         result = payload.get("result", [])
         return {item["id"]: item for item in result if "id" in item}
+
+    def get_argo_tiered_caching(self, zone_id: str) -> dict[str, Any]:
+        return self._get_result_or_status(f"/zones/{zone_id}/argo/tiered_caching")
+
+    def get_tiered_cache_smart_topology(self, zone_id: str) -> dict[str, Any]:
+        return self._get_result_or_status(
+            f"/zones/{zone_id}/cache/tiered_cache_smart_topology_enable"
+        )
+
+    def get_cache_reserve(self, zone_id: str) -> dict[str, Any]:
+        return self._get_result_or_status(f"/zones/{zone_id}/cache/cache_reserve")
+
+    def list_rulesets(self, zone_id: str) -> list[dict[str, Any]]:
+        payload = self._get_json(f"/zones/{zone_id}/rulesets")
+        return payload.get("result") or []
+
+    def get_ruleset(self, zone_id: str, ruleset_id: str) -> dict[str, Any]:
+        # Some rulesets (Cloudflare-managed) are listable but not deeply readable
+        # by the caller's token — that's a plan/scope thing, not a real error.
+        return self._get_result_or_status(f"/zones/{zone_id}/rulesets/{ruleset_id}")
+
+    def list_pagerules(self, zone_id: str) -> list[dict[str, Any]]:
+        payload = self._get_json(f"/zones/{zone_id}/pagerules")
+        return payload.get("result") or []
+
+
+# ---------------------------------------------------------------------------
+# Per-zone state aggregator
+# ---------------------------------------------------------------------------
+
+
+def collect_zone_state(
+    cf: CloudflareClient, zone_id: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Build the v2 snapshot dict for a zone.
+
+    Returns (snapshot, errors). `errors` is a list of human-readable strings;
+    when non-empty, the cycle is considered failed (no success healthcheck
+    ping, no .last_run update).
+    """
+    errors: list[str] = []
+    snapshot: dict[str, Any] = {"_schema": SNAPSHOT_SCHEMA}
+
+    def _section(name: str, fn: Any, *args: Any) -> Any:
+        try:
+            return fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{name}: {exc}")
+            return None
+
+    settings = _section("settings", cf.get_zone_settings, zone_id)
+    if settings is not None:
+        snapshot["settings"] = settings
+
+    argo = _section("argo_tiered_caching", cf.get_argo_tiered_caching, zone_id)
+    if argo is not None:
+        snapshot["argo_tiered_caching"] = argo
+
+    smart = _section(
+        "tiered_cache_smart_topology", cf.get_tiered_cache_smart_topology, zone_id
+    )
+    if smart is not None:
+        snapshot["tiered_cache_smart_topology"] = smart
+
+    reserve = _section("cache_reserve", cf.get_cache_reserve, zone_id)
+    if reserve is not None:
+        snapshot["cache_reserve"] = reserve
+
+    rulesets_list = _section("rulesets", cf.list_rulesets, zone_id)
+    if rulesets_list is not None:
+        rulesets: dict[str, dict[str, Any]] = {}
+        for rs in rulesets_list:
+            rs_id = rs.get("id")
+            if not rs_id:
+                continue
+            detail = _section(f"ruleset {rs_id}", cf.get_ruleset, zone_id, rs_id)
+            if detail is not None:
+                rulesets[rs_id] = detail
+        snapshot["rulesets"] = rulesets
+
+    pagerules_list = _section("pagerules", cf.list_pagerules, zone_id)
+    if pagerules_list is not None:
+        snapshot["pagerules"] = {
+            pr["id"]: pr for pr in pagerules_list if "id" in pr
+        }
+
+    return snapshot, errors
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +309,13 @@ def load_latest_snapshot(
     return json.loads(files[-1].read_text())
 
 
+def is_legacy_snapshot(snapshot: dict[str, Any] | None) -> bool:
+    """A v1 snapshot is a flat {setting_id: {...}} without our schema sentinel."""
+    if not snapshot:
+        return False
+    return snapshot.get("_schema") != SNAPSHOT_SCHEMA
+
+
 # ---------------------------------------------------------------------------
 # Diff + formatting
 # ---------------------------------------------------------------------------
@@ -199,8 +340,10 @@ def format_diff_for_telegram(zone_name: str, zone_id: str, diff: DeepDiff) -> st
     ]
 
     changed = diff.get("values_changed", {}) | diff.get("type_changes", {})
-    added = diff.get("dictionary_item_added", {})
-    removed = diff.get("dictionary_item_removed", {})
+    added = diff.get("dictionary_item_added", {}) | diff.get("iterable_item_added", {})
+    removed = diff.get("dictionary_item_removed", {}) | diff.get(
+        "iterable_item_removed", {}
+    )
 
     if changed:
         lines.append("\n🔁 *Changed*")
@@ -214,7 +357,7 @@ def format_diff_for_telegram(zone_name: str, zone_id: str, diff: DeepDiff) -> st
             )
 
     if added:
-        lines.append("\n🆕 *New settings* \\(likely a Cloudflare\\-added feature\\)")
+        lines.append("\n🆕 *New* \\(likely a Cloudflare\\-added feature or new rule\\)")
         for path, value in added.items():
             lines.append(
                 f"• `{escape_markdown(path, version=2)}` \\= "
@@ -240,14 +383,16 @@ def format_diff_for_telegram(zone_name: str, zone_id: str, diff: DeepDiff) -> st
 # ---------------------------------------------------------------------------
 
 
-async def send_telegram(bot: Bot, chat_id: str, text: str) -> None:
-    """Send a MarkdownV2 message; log and swallow Telegram errors."""
+async def send_telegram(bot: Bot, chat_id: str, text: str) -> bool:
+    """Send a MarkdownV2 message. Returns True on success, False on failure."""
     try:
         await bot.send_message(
             chat_id=chat_id, text=text, parse_mode=ParseMode.MARKDOWN_V2
         )
+        return True
     except Exception as exc:  # noqa: BLE001 - never crash the loop on notify failure
         logger.error("Telegram send failed: %s", exc)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -255,45 +400,73 @@ async def send_telegram(bot: Bot, chat_id: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def run_once(cf: CloudflareClient, bot: Bot, cfg: Config) -> None:
-    """Run a single audit pass over every zone."""
+async def run_once(cf: CloudflareClient, bot: Bot, cfg: Config) -> bool:
+    """Run a single audit pass over every zone.
+
+    Returns True iff the entire cycle succeeded:
+    - zone listing worked
+    - every per-zone fetch succeeded (graceful 4xx for unavailable features
+      does NOT count as failure)
+    - every Telegram drift alert that was attempted was delivered.
+    """
     ping_healthchecks(cfg.healthchecks_url, "/start")
+    failures: list[str] = []
+
     try:
         zones = cf.list_zones()
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to list zones: %s", exc)
         ping_healthchecks(cfg.healthchecks_url, "/fail")
-        return
+        return False
 
     logger.info("Auditing %d zone(s)", len(zones))
 
     for zone in zones:
         zone_id = zone["id"]
         zone_name = zone.get("name", zone_id)
-        try:
-            new_settings = cf.get_zone_settings(zone_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[%s] failed to fetch settings: %s", zone_name, exc)
+
+        new_state, zone_errors = collect_zone_state(cf, zone_id)
+        if zone_errors:
+            for err in zone_errors:
+                logger.error("[%s] %s", zone_name, err)
+                failures.append(f"{zone_name}: {err}")
+            # Don't snapshot a partial state — it would create false drift.
             continue
 
         previous = load_latest_snapshot(cfg.snapshots_dir, zone_id)
-        snapshot_path = save_snapshot(cfg.snapshots_dir, zone_id, new_settings)
+        snapshot_path = save_snapshot(cfg.snapshots_dir, zone_id, new_state)
 
         if previous is None:
             logger.info("[%s] baseline snapshot saved (%s)", zone_name, snapshot_path.name)
             continue
 
-        diff = compute_diff(previous, new_settings)
+        if is_legacy_snapshot(previous):
+            logger.info(
+                "[%s] legacy snapshot detected, re-baselining to v2 (%s)",
+                zone_name,
+                snapshot_path.name,
+            )
+            continue
+
+        diff = compute_diff(previous, new_state)
         if not diff:
             logger.info("[%s] no changes", zone_name)
             continue
 
         logger.warning("[%s] drift detected: %s", zone_name, list(diff.keys()))
         message = format_diff_for_telegram(zone_name, zone_id, diff)
-        await send_telegram(bot, cfg.telegram_chat_id, message)
+        delivered = await send_telegram(bot, cfg.telegram_chat_id, message)
+        if not delivered:
+            failures.append(f"{zone_name}: telegram alert delivery failed")
+
+    if failures:
+        logger.error("Cycle finished with %d failure(s)", len(failures))
+        ping_healthchecks(cfg.healthchecks_url, "/fail")
+        return False
 
     LAST_RUN_MARKER.write_text(datetime.now(timezone.utc).isoformat())
     ping_healthchecks(cfg.healthchecks_url)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +478,10 @@ async def main_once(cfg: Config) -> None:
     """Run a single audit cycle and exit."""
     cfg.snapshots_dir.mkdir(parents=True, exist_ok=True)
     async with Bot(cfg.telegram_token) as bot:
-        with CloudflareClient(cfg.cloudflare_token) as cf:
+        with CloudflareClient(
+            cfg.cloudflare_token,
+            request_delay_seconds=cfg.request_delay_seconds,
+        ) as cf:
             await run_once(cf, bot, cfg)
 
 
@@ -326,7 +502,10 @@ async def main_loop(cfg: Config) -> None:
             signal.signal(sig, _handle_signal)
 
     async with Bot(cfg.telegram_token) as bot:
-        with CloudflareClient(cfg.cloudflare_token) as cf:
+        with CloudflareClient(
+            cfg.cloudflare_token,
+            request_delay_seconds=cfg.request_delay_seconds,
+        ) as cf:
             while not stop_event.is_set():
                 try:
                     await run_once(cf, bot, cfg)
