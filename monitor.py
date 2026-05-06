@@ -48,7 +48,7 @@ class Config:
     interval_seconds: int
     snapshots_dir: Path
     healthchecks_url: str | None
-    request_delay_seconds: float = 2.0
+    request_delay_seconds: float = 4.0
 
 
 def load_config() -> Config:
