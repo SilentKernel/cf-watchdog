@@ -101,6 +101,12 @@ def ping_healthchecks(base_url: str | None, suffix: str = "") -> None:
 # so a future plan upgrade surfaces as drift.
 _GRACEFUL_STATUSES = (403, 404, 405)
 
+# Transient failures worth retrying before declaring the cycle failed.
+# Expected 4xx (incl. the graceful 403/404/405) are never retried.
+RETRY_ATTEMPTS = 5
+RETRY_DELAY_SECONDS = 1.0
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
 
 class CloudflareClient:
     """Thin wrapper around the Cloudflare REST API."""
@@ -111,6 +117,8 @@ class CloudflareClient:
         *,
         client: httpx.Client | None = None,
         request_delay_seconds: float = 0.0,
+        retry_attempts: int = RETRY_ATTEMPTS,
+        retry_delay_seconds: float = RETRY_DELAY_SECONDS,
         sleep: Any = time.sleep,
     ) -> None:
         self._client = client or httpx.Client(
@@ -122,6 +130,8 @@ class CloudflareClient:
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
         self._request_delay = request_delay_seconds
+        self._retry_attempts = max(1, retry_attempts)
+        self._retry_delay = retry_delay_seconds
         self._sleep = sleep
         self._first_request = True
 
@@ -141,7 +151,29 @@ class CloudflareClient:
             self._first_request = False
         elif self._request_delay > 0:
             self._sleep(self._request_delay)
-        return self._client.get(path, **kwargs)
+
+        last_exc: httpx.TransportError | None = None
+        for attempt in range(1, self._retry_attempts + 1):
+            try:
+                response = self._client.get(path, **kwargs)
+            except httpx.TransportError as exc:
+                last_exc = exc
+                failure = str(exc)
+            else:
+                last_exc = None
+                if response.status_code not in _RETRYABLE_STATUSES:
+                    return response
+                failure = f"HTTP {response.status_code}"
+            if attempt < self._retry_attempts:
+                logger.warning(
+                    "GET %s failed (attempt %d/%d): %s — retrying in %.1fs",
+                    path, attempt, self._retry_attempts, failure, self._retry_delay,
+                )
+                if self._retry_delay > 0:
+                    self._sleep(self._retry_delay)
+        if last_exc is not None:
+            raise last_exc
+        return response
 
     def _get_json(self, path: str, **kwargs: Any) -> dict[str, Any]:
         r = self._get(path, **kwargs)

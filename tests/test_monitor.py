@@ -17,12 +17,19 @@ import monitor
 # ---------------------------------------------------------------------------
 
 
-def _make_client(httpx_mock, *, request_delay_seconds: float = 0.0, sleep=None) -> monitor.CloudflareClient:
+def _make_client(httpx_mock, *, request_delay_seconds: float = 0.0,
+                 retry_attempts: int = 1, retry_delay_seconds: float = 0.0,
+                 sleep=None) -> monitor.CloudflareClient:
     real = httpx.Client(
         base_url=monitor.CLOUDFLARE_API_BASE,
         headers={"Authorization": "Bearer test"},
     )
-    kwargs = {"client": real, "request_delay_seconds": request_delay_seconds}
+    kwargs = {
+        "client": real,
+        "request_delay_seconds": request_delay_seconds,
+        "retry_attempts": retry_attempts,
+        "retry_delay_seconds": retry_delay_seconds,
+    }
     if sleep is not None:
         kwargs["sleep"] = sleep
     return monitor.CloudflareClient(token="test", **kwargs)
@@ -247,6 +254,109 @@ def test_request_delay_skips_first_call_then_sleeps(httpx_mock):
 
     # 3 calls → sleep should have fired 2 times (skip the first)
     assert sleep_calls == [2.0, 2.0]
+
+
+# ---------------------------------------------------------------------------
+# Retries
+# ---------------------------------------------------------------------------
+
+
+_SETTINGS_URL = f"{monitor.CLOUDFLARE_API_BASE}/zones/z/settings"
+
+
+def test_retry_recovers_from_transient_500(httpx_mock):
+    httpx_mock.add_response(url=_SETTINGS_URL, status_code=500, json={"success": False})
+    httpx_mock.add_response(
+        url=_SETTINGS_URL, json=_settings_payload([{"id": "http3", "value": "off"}])
+    )
+
+    sleep_calls: list[float] = []
+    with _make_client(httpx_mock, retry_attempts=5, retry_delay_seconds=1.0,
+                      sleep=sleep_calls.append) as cf:
+        settings = cf.get_zone_settings("z")
+
+    assert settings["http3"]["value"] == "off"
+    assert sleep_calls == [1.0]
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_retry_recovers_from_transient_connect_error(httpx_mock):
+    httpx_mock.add_exception(httpx.ConnectError("nope"), url=_SETTINGS_URL)
+    httpx_mock.add_response(
+        url=_SETTINGS_URL, json=_settings_payload([{"id": "http3", "value": "on"}])
+    )
+
+    with _make_client(httpx_mock, retry_attempts=5, retry_delay_seconds=1.0,
+                      sleep=lambda s: None) as cf:
+        settings = cf.get_zone_settings("z")
+
+    assert settings["http3"]["value"] == "on"
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_retry_gives_up_after_max_attempts_on_500(httpx_mock):
+    for _ in range(5):
+        httpx_mock.add_response(url=_SETTINGS_URL, status_code=500, json={"success": False})
+
+    sleep_calls: list[float] = []
+    with _make_client(httpx_mock, retry_attempts=5, retry_delay_seconds=1.0,
+                      sleep=sleep_calls.append) as cf:
+        with pytest.raises(httpx.HTTPStatusError):
+            cf.get_zone_settings("z")
+
+    assert len(httpx_mock.get_requests()) == 5
+    assert sleep_calls == [1.0] * 4  # sleeps between attempts, not after the last
+
+
+def test_retry_gives_up_after_max_attempts_on_connect_error(httpx_mock):
+    for _ in range(5):
+        httpx_mock.add_exception(httpx.ConnectError("nope"), url=_SETTINGS_URL)
+
+    with _make_client(httpx_mock, retry_attempts=5, retry_delay_seconds=1.0,
+                      sleep=lambda s: None) as cf:
+        with pytest.raises(httpx.ConnectError):
+            cf.get_zone_settings("z")
+
+    assert len(httpx_mock.get_requests()) == 5
+
+
+def test_retry_skips_graceful_403(httpx_mock):
+    httpx_mock.add_response(
+        url=f"{monitor.CLOUDFLARE_API_BASE}/zones/z/cache/cache_reserve",
+        status_code=403,
+        json={"success": False},
+    )
+
+    sleep_calls: list[float] = []
+    with _make_client(httpx_mock, retry_attempts=5, retry_delay_seconds=1.0,
+                      sleep=sleep_calls.append) as cf:
+        assert cf.get_cache_reserve("z") == {"_status": 403}
+
+    assert len(httpx_mock.get_requests()) == 1
+    assert sleep_calls == []
+
+
+def test_retry_handles_429(httpx_mock):
+    httpx_mock.add_response(url=_SETTINGS_URL, status_code=429, json={"success": False})
+    httpx_mock.add_response(
+        url=_SETTINGS_URL, json=_settings_payload([{"id": "http3", "value": "off"}])
+    )
+
+    with _make_client(httpx_mock, retry_attempts=5, retry_delay_seconds=1.0,
+                      sleep=lambda s: None) as cf:
+        settings = cf.get_zone_settings("z")
+
+    assert settings["http3"]["value"] == "off"
+    assert len(httpx_mock.get_requests()) == 2
+
+
+def test_default_retry_config():
+    cf = monitor.CloudflareClient(token="test")
+    try:
+        assert cf._retry_attempts == 5
+        assert cf._retry_delay == 1.0
+    finally:
+        cf.close()
 
 
 # ---------------------------------------------------------------------------
